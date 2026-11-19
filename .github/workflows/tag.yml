@@ -1,0 +1,40 @@
+name: Tag version
+
+# Actions → Tag version → Run workflow on main, with a version like 1.0.0.
+# Creates tag v1.0.0 and moves the major tag v1 to it (callers on @v1 get it; callers pinned to
+# @v1.0.0 or a SHA don't). Only for backward-compatible changes on the same major; breaking
+# changes get a new major (2.0.0 → v2).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version, X.Y.Z
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be X.Y.Z"; exit 1; }
+          git fetch --tags --force origin
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::v$VERSION already exists"; exit 1
+          fi
+          major="v${VERSION%%.*}"
+          git tag "v$VERSION" "$GITHUB_SHA"
+          git tag -f "$major" "$GITHUB_SHA"
+          git push origin "refs/tags/v$VERSION"
+          git push -f origin "refs/tags/$major"
+          echo "Tagged v$VERSION and moved $major → ${GITHUB_SHA:0:7}" >> "$GITHUB_STEP_SUMMARY"

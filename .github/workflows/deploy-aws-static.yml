@@ -1,0 +1,164 @@
+name: Deploy AWS static site
+
+# Reusable: deploy a SAM/CloudFormation stack with GitHub OIDC, upload a built site to its S3
+# bucket and invalidate CloudFront. Run the health check (ZapsCommerce/cicd/smoke) in the caller
+# after this, so a failed check stops the release.
+#
+# The stack must output BucketName, DistributionId and SiteUrl.
+# Callers grant `id-token: write` and `contents: read`.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub environment (dev, production); the AWS role trusts only this one
+        type: string
+        required: true
+      role-arn:
+        description: Deploy role in the target AWS account (aws/github-deploy-role.yaml)
+        type: string
+        required: true
+      region:
+        type: string
+        required: true
+      stack-name:
+        type: string
+        required: true
+      template-file:
+        type: string
+        default: aws/template.yaml
+      parameters:
+        description: >-
+          Stack parameters as YAML ("Key: value" per line). Write out every parameter, empty ones
+          too: SAM keeps a stack's previous value for any parameter left out.
+        type: string
+        default: ""
+      ssm-parameters:
+        description: >-
+          Secret stack parameters read from SSM in the target account, one "Key=/ssm/name" per line.
+        type: string
+        default: ""
+      artifact:
+        description: Name of the build artifact uploaded by the caller
+        type: string
+        default: site
+      static-dir:
+        description: Folder inside the build with cache-busted assets (cached for a year); empty = none
+        type: string
+        default: static
+      tags:
+        description: Stack tags, "key=value key2=value2" (default project=<stack-name>)
+        type: string
+        default: ""
+    secrets:
+      parameter-secrets:
+        description: "Secret stack parameters as YAML (Key: value per line), optional"
+        required: false
+    outputs:
+      url:
+        description: SiteUrl output of the stack
+        value: ${{ jobs.deploy.outputs.url }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ steps.upload.outputs.url }}
+    concurrency:
+      group: deploy-${{ inputs.environment }}-${{ inputs.stack-name }}
+      cancel-in-progress: false
+    outputs:
+      url: ${{ steps.upload.outputs.url }}
+    env:
+      AWS_REGION: ${{ inputs.region }}
+      STACK_NAME: ${{ inputs.stack-name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}
+          path: build/
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role-arn }}
+          aws-region: ${{ inputs.region }}
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Deploy stack
+        env:
+          PARAMETERS: ${{ inputs.parameters }}
+          SSM_PARAMETERS: ${{ inputs.ssm-parameters }}
+          PARAMETER_SECRETS: ${{ secrets.parameter-secrets }}
+          TEMPLATE_FILE: ${{ inputs.template-file }}
+          STACK_TAGS: ${{ inputs.tags }}
+        run: |
+          set -euo pipefail
+          params="$RUNNER_TEMP/params.yaml"
+          q() { printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'; }
+          : > "$params"
+          if [ -n "$PARAMETERS" ]; then printf '%s\n' "$PARAMETERS" >> "$params"; fi
+          while IFS= read -r line; do
+            line="$(echo "$line" | xargs)"; [ -n "$line" ] || continue
+            key="${line%%=*}"; name="${line#*=}"
+            value=$(aws ssm get-parameter --name "$name" --with-decryption --query Parameter.Value --output text)
+            echo "::add-mask::$value"
+            echo "$key: $(q "$value")" >> "$params"
+          done <<< "$SSM_PARAMETERS"
+          if [ -n "$PARAMETER_SECRETS" ]; then printf '%s\n' "$PARAMETER_SECRETS" >> "$params"; fi
+          # Must be a flat mapping, or SAM would misread it.
+          python3 - "$params" <<'PY'
+          import sys, yaml
+          d = yaml.safe_load(open(sys.argv[1])) or {}
+          assert isinstance(d, dict), "parameters must be 'Key: value' lines"
+          print("Parameters:", ", ".join(sorted(d)) or "none")
+          PY
+          args=()
+          [ -s "$params" ] && args=(--parameter-overrides "file://$params")
+          sam deploy \
+            --template-file "$TEMPLATE_FILE" \
+            --stack-name "$STACK_NAME" \
+            --region "$AWS_REGION" \
+            --resolve-s3 \
+            --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --tags ${STACK_TAGS:-project=$STACK_NAME} \
+            "${args[@]}"
+          rm -f "$params"
+
+      - name: Upload site and invalidate CloudFront
+        id: upload
+        env:
+          STATIC_DIR: ${{ inputs.static-dir }}
+        run: |
+          output() {
+            aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+              --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+          }
+          BUCKET=$(output BucketName)
+          DISTRIBUTION=$(output DistributionId)
+          exclude=()
+          # Assets first (URLs are cache-busted), so new pages never point at missing files.
+          if [ -n "$STATIC_DIR" ] && [ -d "build/$STATIC_DIR" ]; then
+            aws s3 sync "build/$STATIC_DIR" "s3://$BUCKET/$STATIC_DIR" --delete \
+              --cache-control "public, max-age=31536000, immutable"
+            exclude=(--exclude "$STATIC_DIR/*")
+          fi
+          # Pages: browsers revalidate, CloudFront keeps them until the invalidation below.
+          aws s3 sync build "s3://$BUCKET" --delete "${exclude[@]}" \
+            --cache-control "public, max-age=0, s-maxage=86400, must-revalidate"
+          aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION" --paths "/*" \
+            --query "Invalidation.Id" --output text
+          URL=$(output SiteUrl)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Deployed ${{ inputs.environment }}: $URL" >> "$GITHUB_STEP_SUMMARY"
